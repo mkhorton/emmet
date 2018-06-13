@@ -10,6 +10,8 @@ from pymatgen.analysis.diffraction.xrd import XRDCalculator, WAVELENGTHS
 
 from maggma.builder import Builder
 
+from emmet.common.utils import load_settings
+
 __author__ = "Shyam Dwaraknath <shyamd@lbl.gov>"
 
 module_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
@@ -32,9 +34,9 @@ class DiffractionBuilder(Builder):
 
         self.materials = materials
         self.diffraction = diffraction
-        self.xrd_settings = xrd_settings if xrd_settings else default_xrd_settings
+        self.xrd_settings = xrd_settings
         self.query = query if query else {}
-        self.__settings = loadfn(self.xrd_settings)
+        self.__settings = load_settings(self.xrd_settings, default_xrd_settings)
 
         super().__init__(sources=[materials],
                          targets=[diffraction],
@@ -60,6 +62,7 @@ class DiffractionBuilder(Builder):
         mats = list(self.materials.distinct(self.materials.key, q))
         self.logger.info(
             "Found {} new materials for diffraction data".format(len(mats)))
+        self.total = len(mats)
         for m in mats:
             yield self.materials.query(properties=[self.materials.key, "structure", self.materials.lu_field],
                                        criteria={self.materials.key: m}).limit(1)[0]
@@ -94,7 +97,7 @@ class DiffractionBuilder(Builder):
             xrdcalc = XRDCalculator(wavelength="".join([xs['target'], xs['edge']]),
                                     symprec=xs.get('symprec', 0))
 
-            pattern = jsanitize(xrdcalc.get_xrd_pattern(
+            pattern = jsanitize(xrdcalc.get_pattern(
                 structure, two_theta_range=xs['two_theta']).as_dict())
             d = {'wavelength': {'element': xs['target'],
                                 'in_angstroms': WAVELENGTHS["".join([xs['target'], xs['edge']])]},
