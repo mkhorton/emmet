@@ -6,20 +6,18 @@ import copy
 import nltk
 import numpy as np
 from ast import literal_eval
-from pymongo import ASCENDING, DESCENDING
 
-from monty.serialization import loadfn
 from monty.json import jsanitize
 
 from maggma.builder import Builder
 from pydash.objects import get, set_, has
 
 from emmet.materials.snls import mp_default_snl_fields
+from emmet.common.utils import scrub_class_and_module
 
 # Import for crazy things this builder needs
 from pymatgen.io.cif import CifWriter
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from pymatgen.core.composition import Composition
 from pymatgen import Structure
 from pymatgen.analysis.structure_analyzer import oxide_type
 from pymatgen.analysis.structure_analyzer import RelaxationAnalyzer
@@ -54,7 +52,7 @@ mp_conversion_dict = {
     "run_type": "calc_settings.run_type",
     "spacegroup": "spacegroup",
     "structure": "structure",
-    "total_magnetization": "magnestism.total_magnetization",
+    "total_magnetization": "magnetism.total_magnetization",
     "unit_cell_formula": "composition",
     "volume": "volume",
     "warnings": "analysis.warnings",
@@ -63,7 +61,8 @@ mp_conversion_dict = {
     "original_task_id": "task_id",
     "input.incar": "inputs.structure_optimization.incar",
     "input.kpoints": "inputs.structure_optimization.kpoints",
-    "encut": "inputs.structure_optimization.incar.ENCUT"
+    "encut": "inputs.structure_optimization.incar.ENCUT",
+    "formula_anonymous": "formula_anonymous"
 }
 
 SANDBOXED_PROPERTIES = {"e_above_hull": "e_above_hull", "decomposes_to": "decomposes_to"}
@@ -83,6 +82,7 @@ class MPBuilder(Builder):
                  elastic=None,
                  dielectric=None,
                  dois=None,
+                 propnet=None,
                  query=None,
                  **kwargs):
         """
@@ -105,8 +105,11 @@ class MPBuilder(Builder):
         self.elastic = elastic
         self.dielectric = dielectric
         self.dois = dois
+        self.propnet = propnet
 
-        sources = list(filter(None, [materials, thermo, electronic_structure, snls, elastic, dielectric, xrd]))
+        sources = list(
+            filter(None, [materials, thermo, electronic_structure, snls,
+                          elastic, dielectric, xrd, dois, propnet]))
 
         super().__init__(sources=sources, targets=[mp_materials], **kwargs)
 
@@ -137,7 +140,7 @@ class MPBuilder(Builder):
 
         self.logger.info("Found {} updated materials for the website".format(len(mats)))
 
-        mats = set(mats) | new_mats
+        mats = mats | new_mats
         self.logger.info("Processing {} total materials".format(len(mats)))
         self.total = len(mats)
 
@@ -171,6 +174,10 @@ class MPBuilder(Builder):
             if self.dois:
                 doc["dois"] = self.dois.query_one(criteria={self.dois.key: m})
 
+            if self.propnet:
+                doc['propnet'] = self.propnet.query_one(
+                    criteria={self.propnet.key: m})
+
             yield doc
 
     def process_item(self, item):
@@ -196,13 +203,17 @@ class MPBuilder(Builder):
             thermo = item["thermo"]
             add_thermo(mat, thermo)
 
-        if item.get("doi", None):
-            doi = item["doi"]
+        if item.get("dois", None):
+            doi = item["dois"]
             add_dois(mat, doi)
+
+        if item.get("propnet", None):
+            propnet = item["propnet"]
+            add_propnet(mat, propnet)
 
         snl = item.get("snl", {})
         add_snl(mat, snl)
-
+        add_magnetism(mat)
         sandbox_props(mat)
         has_fields(mat)
         return jsanitize(mat)
@@ -218,7 +229,7 @@ class MPBuilder(Builder):
 
         if len(items) > 0:
             self.logger.info("Updating {} mp materials docs".format(len(items)))
-            self.mp_materials.update(docs=items)
+            self.mp_materials.update(docs=items, ordered=False)
         else:
             self.logger.info("No items to update")
 
@@ -227,12 +238,6 @@ class MPBuilder(Builder):
         Ensures indexes on the tasks and materials collections
         :return:
         """
-
-        # Basic search index for tasks
-        self.tasks.ensure_index("task_id", unique=True)
-        self.tasks.ensure_index("state")
-        self.tasks.ensure_index("formula_pretty")
-        self.tasks.ensure_index(self.tasks.lu_field)
 
         # Search index for materials
         self.materials.ensure_index(self.materials.key, unique=True)
@@ -263,11 +268,14 @@ def old_style_mat(new_style_mat):
 
     struc = Structure.from_dict(mat["structure"])
     mat["oxide_type"] = oxide_type(struc)
-    mat["reduced_cell_formula"] = struc.composition.as_dict()
+    mat["reduced_cell_formula"] = struc.composition.reduced_composition.as_dict()
+    mat["unit_cell_formula"] = struc.composition.as_dict()
     mat["full_formula"] = "".join(struc.formula.split())
     vals = sorted(mat["reduced_cell_formula"].values())
     mat["anonymous_formula"] = {string.ascii_uppercase[i]: float(vals[i]) for i in range(len(vals))}
     mat["initial_structure"] = new_style_mat.get("initial_structure", None)
+    mat["nsites"] = struc.get_primitive_structure().num_sites
+
 
     set_(mat, "pseudo_potential.functional", "PBE")
 
@@ -329,10 +337,13 @@ def add_elastic(mat, elastic):
         "homogeneous_poisson": "homogeneous_poisson",
         "poisson_ratio": "homogeneous_poisson",
         "universal_anisotropy": "universal_anisotropy",
-        "elastic_tensor_original": "elastic_tensor_original"
+        "elastic_tensor_original": "elastic_tensor_original",
+        "compliance_tensor": "compliance_tensor",
+        "third_order": "third_order"
     }
 
-    mat["elasticity"] = {k: elastic["elasticity"][v] for k, v in es_aliases.items()}
+    mat["elasticity"] = {k: elastic["elasticity"].get(v, None)
+                         for k, v in es_aliases.items()}
     if has(elastic, "elasticity.structure.sites"):
         mat["elasticity"]["nsites"] = len(get(elastic, "elasticity.structure.sites"))
     else:
@@ -340,8 +351,9 @@ def add_elastic(mat, elastic):
 
 
 def add_cifs(doc):
+    symprec = 0.1
     struc = Structure.from_dict(doc["structure"])
-    sym_finder = SpacegroupAnalyzer(struc, symprec=0.1)
+    sym_finder = SpacegroupAnalyzer(struc, symprec=symprec)
     doc["cif"] = str(CifWriter(struc))
     doc["cifs"] = {}
     if sym_finder.get_hall():
@@ -349,7 +361,7 @@ def add_cifs(doc):
         conventional = sym_finder.get_conventional_standard_structure()
         refined = sym_finder.get_refined_structure()
         doc["cifs"]["primitive"] = str(CifWriter(primitive))
-        doc["cifs"]["refined"] = str(CifWriter(refined))
+        doc["cifs"]["refined"] = str(CifWriter(refined, symprec=symprec))
         doc["cifs"]["conventional_standard"] = str(CifWriter(conventional))
         doc["cifs"]["computed"] = str(CifWriter(struc))
         doc["spacegroup"]["symbol"] = sym_finder.get_space_group_symbol()
@@ -419,40 +431,49 @@ def add_snl(mat, snl=None):
         mat["snl"]["about"].update(mp_default_snl_fields)
 
     mat["snl_final"] = mat["snl"]
-    mat["icsd_ids"] = get(mat["snl"], "about._db_ids.icsd_ids", [])
+    mat["icsd_ids"] = [int(i) for i in get(mat["snl"], "about._db_ids.icsd_ids", [])]
     mat["pf_ids"] = get(mat["snl"], "about._db_ids.pf_ids", [])
 
     # Extract tags from remarks by looking for just nounds and adjectives
     mat["exp"] = {"tags": []}
-    mat["tags"] = []
-    for remark in mat["snl"]["about"].get("remarks", []):
+    for remark in mat["snl"]["about"].get("_tags", []):
         tokens = set(tok[1] for tok in nltk.pos_tag(nltk.word_tokenize(remark), tagset='universal'))
         if len(tokens.intersection({"ADV", "ADP", "VERB"})) == 0:
             mat["exp"]["tags"].append(remark)
+
+
+def add_propnet(mat, propnet):
+    exclude_list = ['compliance_tensor_voigt', 'task_id', '_id',
+                    'pretty_formula', 'inputs', 'last_updated']
+    for e in exclude_list:
+        if e in propnet:
+            del propnet[e]
+    mat["propnet"] = scrub_class_and_module(propnet)
 
 
 def check_relaxation(mat, new_style_mat):
     final_structure = Structure.from_dict(mat["structure"])
 
     warnings = []
-    for init_struc in new_style_mat["initial_structures"]:
-        # Check relaxation
-        orig_crystal = Structure.from_dict(init_struc)
+    # Check relaxation for just the initial structure to optimized structure
+    init_struc = new_style_mat["initial_structure"]
 
-        try:
-            analyzer = RelaxationAnalyzer(orig_crystal, final_structure)
-            latt_para_percentage_changes = analyzer.get_percentage_lattice_parameter_changes()
-            for l in ["a", "b", "c"]:
-                change = latt_para_percentage_changes[l] * 100
-                if change < latt_para_interval[0] or change > latt_para_interval[1]:
-                    warnings.append("Large change in a lattice parameter during relaxation.")
-            change = analyzer.get_percentage_volume_change() * 100
-            if change < vol_interval[0] or change > vol_interval[1]:
-                warnings.append("Large change in volume during relaxation.")
-        except Exception as ex:
-            # print icsd_crystal.formula
-            # print final_structure.formula
-            print("Relaxation analyzer failed for Material:{} due to {}".format(mat["task_id"], traceback.print_exc()))
+    orig_crystal = Structure.from_dict(init_struc)
+
+    try:
+        analyzer = RelaxationAnalyzer(orig_crystal, final_structure)
+        latt_para_percentage_changes = analyzer.get_percentage_lattice_parameter_changes()
+        for l in ["a", "b", "c"]:
+            change = latt_para_percentage_changes[l] * 100
+            if change < latt_para_interval[0] or change > latt_para_interval[1]:
+                warnings.append("Large change in a lattice parameter during relaxation.")
+        change = analyzer.get_percentage_volume_change() * 100
+        if change < vol_interval[0] or change > vol_interval[1]:
+            warnings.append("Large change in volume during relaxation.")
+    except Exception as ex:
+        # print icsd_crystal.formula
+        # print final_structure.formula
+        print("Relaxation analyzer failed for Material:{} due to {}".format(mat["task_id"], traceback.print_exc()))
 
     mat["warnings"] = list(set(warnings))
 
@@ -477,7 +498,9 @@ def add_dielectric(mat, dielectric):
 
 
 def has_fields(mat):
-    mat["has"] = [prop for prop in ["elasticity", "piezo", "diel", "bandstructure"] if prop in mat]
+    mat["has"] = [prop for prop in ["elasticity", "piezo", "diel"] if prop in mat]
+    if "band_structure" in mat:
+        mat["has"].append("bandstructure")
 
 
 def add_dois(mat, doi):
